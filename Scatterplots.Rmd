@@ -1,0 +1,486 @@
+---
+title: "CSA Scatterplots — Standardized & Reproducible"
+author: "Shreya Shankar (sshankar@mitre.org)"
+date: "2025-08-05"
+output:
+  word_document: default
+  html_document: default
+---
+<u>**Overview & Policy Context**</u>
+
+**What this produces:** three standardized scatterplots that relate Medicare Advantage (MA) enrollment (size of the market) and MA penetration (share of eligibles enrolled) at different geographic resolutions. The quadrants are split at sample medians so audiences can quickly see High/Low Enrollment × High/Low Penetration patterns without remembering absolute cutoffs.
+
+
+**What you’ll see:**
+
+<u>Scatterplot A (CSA+1):</u> Treats each CSA×State as a separate market—useful for surfacing within-CSA, cross-state differences.
+
+<u>Scatterplot B (CSA merged + Non-CSA by state):</u> Collapses split-state CSAs to a single CSA unit and keeps non-CSA rows aggregated by state; color/shape distinguish CSA vs. non-CSA.
+
+<u>Scatterplot C (CSA only):</u> Focuses only on merged CSAs to emphasize market-scale relationships.
+
+*Interpretation note*: The log10 x-axis (enrollment) compresses the right tail so both small and very large markets remain visible.
+
+_____________________________________________________________________________________
+
+<u>**Inputs, Normalization & Reproducibility**</u>
+
+The setup block installs/loads packages, reads DATA_LOCATION.txt, verifies Processed/penrate_r.xlsx, and sets Results/Maps for exports. The helper *parse_pen_rate_frac()* ensures penetration is a fraction in [0, 1] regardless of whether the sheet stored it as 0.62 or 62%. Rows labeled like “All Other Areas – XX” are flagged as non-CSA; everything else includes a parsed CSA code and state.
+
+*Note on “eligible” back-calculation:* When penetration is non-zero, the script computes a rough eligible = enrolled / penetration for proper aggregation in B/C. This keeps penetration weighted correctly when you roll up rows.
+
+_____________________________________________________________________________________
+
+<u>**Quadrants & Labels: How to Read All Three Plots**</u>
+
+Each plot computes its own medians for enrollment and penetration from the data actually plotted on that page. Vertical and horizontal dashed lines mark those medians; colors/legends summarize the n in each quadrant. To keep labels legible, one representative point per quadrant is auto-selected (closest to the quadrant’s mean position) and annotated with *ggrepel*.
+
+**Note**: Because the medians are plot-specific, a CSA can change quadrants between A, B, and C as the comparison set changes (CSA×State vs merged CSAs vs CSAs-only).
+
+```{r setup-packages, message=FALSE, warning=FALSE}
+required <- c(
+  "tidyverse", "readxl", "ggExtra", "ggrepel", "scales", "stringr", "grid"
+)
+new_pkgs <- setdiff(required, rownames(installed.packages()))
+if (length(new_pkgs)) install.packages(new_pkgs, quiet = TRUE)
+lapply(required, library, character.only = TRUE)
+
+#Results path helper
+results_path <- function(filename) file.path(results_dir, filename)
+
+
+stopifnot(file.exists("DATA_LOCATION.txt"))
+data_location <- readr::read_file("DATA_LOCATION.txt") |> stringr::str_trim()
+
+penrate_path <- file.path(data_location, "Processed", "penrate_r.xlsx")
+if (!file.exists(penrate_path)) {
+  stop("Expected file not found: ", penrate_path,
+       "\nEnsure DATA_LOCATION.txt points to the Teams Data folder and that",
+       "\n'Processed/penrate_r.xlsx' exists.")
+}
+
+#Save to Results/Maps
+results_dir <- file.path(data_location, "Results", "Maps")
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+
+
+#Shared helpers (kept minimal to avoid changing results)
+
+#Parse Penetration Rate
+parse_pen_rate_frac <- function(x) {
+  pr <- readr::parse_number(as.character(x))
+  dplyr::if_else(!is.na(pr) & pr > 1, pr / 100, pr)
+}
+
+#Build a minimal frame of the raw rows with normalized columns
+read_penrate_rows <- function(path, sheet = "Sheet1") {
+  readxl::read_excel(path, sheet = sheet) |>
+    dplyr::select(
+      csa_area = `CSA Area`,
+      enrolled = `Sum of Enrolled`,
+      pen_raw  = `Penetration Rate`
+    ) |>
+    dplyr::filter(
+      !is.na(csa_area),
+      !stringr::str_detect(stringr::str_to_lower(csa_area), "grand total")
+    ) |>
+    dplyr::mutate(
+      enrolled         = as.numeric(enrolled),
+      penetration_rate = parse_pen_rate_frac(pen_raw),
+      #Flags/parts used by scatterplots B & C
+      is_non_csa = stringr::str_detect(
+        csa_area,
+        stringr::regex("^\\s*All\\s+Other\\s+Areas\\s*-", ignore_case = TRUE)
+      ),
+      state    = stringr::str_trim(stringr::str_extract(csa_area, "[A-Z]{2}\\s*$")),
+      csa_code = dplyr::if_else(
+        is_non_csa,
+        NA_character_,
+        stringr::str_match(
+          csa_area,
+          stringr::regex("CSA\\s*-\\s*(\\d{3})\\s*-", ignore_case = TRUE)
+        )[, 2]
+      ),
+      eligible = dplyr::if_else(
+        dplyr::coalesce(penetration_rate, 0) > 0,
+        enrolled / penetration_rate,
+        NA_real_
+      )
+    )
+}
+
+#Add quadrant labels based on medians
+add_quadrants <- function(df, x = enrolled, y = penetration_rate) {
+  x <- rlang::enquo(x); y <- rlang::enquo(y)
+  med_x <- stats::median(dplyr::pull(df, !!x), na.rm = TRUE)
+  med_y <- stats::median(dplyr::pull(df, !!y), na.rm = TRUE)
+
+  df |>
+    dplyr::mutate(
+      quadrant = dplyr::case_when(
+        (!!x) <= med_x & (!!y) <= med_y ~ "Low Enroll / Low Penetration",
+        (!!x) >  med_x & (!!y) <= med_y ~ "High Enroll / Low Penetration",
+        (!!x) <= med_x & (!!y) >  med_y ~ "Low Enroll / High Penetration",
+        TRUE                             ~ "High Enroll / High Penetration"
+      ),
+      .after = !!y
+    ) |>
+    #return medians for subtitle
+    dplyr::mutate(`.med_x` = med_x, `.med_y` = med_y)
+}
+
+#Choose one representative label per quadrant
+pick_representatives_by_quadrant <- function(df, lbl_col = "name",
+                                             x = enrolled, y = penetration_rate) {
+  x <- rlang::enquo(x); y <- rlang::enquo(y)
+  df |>
+    dplyr::group_by(quadrant) |>
+    dplyr::mutate(
+      mean_x = mean(!!x, na.rm = TRUE),
+      mean_y = mean(!!y, na.rm = TRUE),
+      dist_to_avg = sqrt(( (!!x) - mean_x )^2 + ( (!!y) - mean_y )^2)
+    ) |>
+    dplyr::slice_min(dist_to_avg, n = 1, with_ties = FALSE) |>
+    dplyr::ungroup() |>
+    dplyr::rename(label = dplyr::all_of(lbl_col))
+}
+
+#colors!
+quadrant_colors <- c(
+  "Low Enroll / Low Penetration"   = "#87DEFF",
+  "High Enroll / Low Penetration"  = "#005B94",
+  "Low Enroll / High Penetration"  = "#063F66",
+  "High Enroll / High Penetration" = "#0B2338"
+)
+type_colors <- c("CSA" = "#0B2338", "Non-CSA" = "#87DEFF")  #for scatterplot B
+
+pen_rows <- read_penrate_rows(penrate_path, sheet = "Sheet1")
+```
+
+<u>**A) CSA+1 — Enrollment vs. Penetration (State Splits Preserved)**</u>
+
+**Purpose.** Keep CSA×State observations separate to reveal cross-state variation within the same CSA. This is helpful when delivery systems, plan participation, or broker networks differ across state lines.
+
+**How to read:**
+
+Rightward means larger enrollment (log10).
+
+Upward means higher penetration (0–100%).
+
+Quadrant counts in the legend tell you where the mass of markets sits.
+
+
+```{r scatterplot-a, message=FALSE, warning=FALSE}
+csa_df_A <- pen_rows |>
+  dplyr::transmute(
+    csa              = csa_area,
+    enrolled         = enrolled,
+    penetration_rate = penetration_rate
+  )
+
+csa_df_A <- add_quadrants(csa_df_A, enrolled, penetration_rate)
+med_enrolled_A <- unique(csa_df_A$.med_x)
+med_penrate_A  <- unique(csa_df_A$.med_y)
+
+#Legend labels include counts
+tab_q_A <- table(csa_df_A$quadrant)
+legend_labels_A <- paste0(names(tab_q_A), " (n = ", as.integer(tab_q_A), ")") |>
+  stats::setNames(names(tab_q_A))
+
+label_df_A <- csa_df_A |>
+  dplyr::transmute(name = csa, dplyr::across(c(enrolled, penetration_rate, quadrant))) |>
+  pick_representatives_by_quadrant(lbl_col = "name", x = enrolled, y = penetration_rate)
+
+scatter_plot_A <- ggplot(
+  csa_df_A, aes(enrolled, penetration_rate, color = quadrant)
+) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_vline(xintercept = med_enrolled_A, linetype = "dashed") +
+  geom_hline(yintercept = med_penrate_A,  linetype = "dashed") +
+  scale_x_log10(
+    breaks = scales::log_breaks(n = 6, base = 10),
+    labels = scales::comma_format()
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(
+    values = quadrant_colors,
+    labels = legend_labels_A,
+    name   = "Quadrant"
+  ) +
+  ggrepel::geom_label_repel(
+    data               = label_df_A,
+    aes(label = label),
+    fill               = "white",
+    colour             = "black",
+    size               = 3,
+    box.padding        = 0.35,
+    point.padding      = 0.3,
+    segment.alpha      = 0.8,
+    min.segment.length = 0,
+    force              = 1.2
+  ) +
+  labs(
+    title    = "Medicare Advantage Enrollment vs. Penetration Rate by CSA",
+    subtitle = paste0(
+      "Quadrants split at medians (Enrolled = ",
+      scales::comma(med_enrolled_A), ", Penetration = ",
+      scales::percent(med_penrate_A, accuracy = 1), ")"
+    ),
+    x = "Total Enrolled Beneficiaries (log10 scale)",
+    y = "Penetration Rate"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position   = "bottom",
+    legend.box.margin = margin(t = 8),
+    plot.margin       = margin(t = 25, r = 10, b = 40, l = 10)
+  )
+
+scatter_with_marginals_A <- ggExtra::ggMarginal(
+  scatter_plot_A,
+  type    = "histogram",
+  margins = "both",
+  bins    = 30,
+  fill    = "white",
+  colour  = "grey30"
+)
+
+print(scatter_with_marginals_A)
+
+ggsave(
+  filename = results_path("MA_enrollment_penetration.png"),
+  plot     = scatter_with_marginals_A,
+  width    = 15, height = 8, units = "in", dpi = 300
+)
+```
+<u>**B) CSA (Merged) + Non-CSA by State — Enrollment vs. Penetration**</u>
+
+**Purpose**. Align with market-level thinking by merging split-state CSAs and by rolling non-CSA counties to a state “all-other” unit. This is often the cleanest view for policy scoping and stakeholder communication.
+
+**How to read:**
+
+Color/shape distinguish CSA vs Non-CSA.
+
+Medians are recalculated on this merged set; expect shifts relative to A.
+
+Marginal histograms show the density of enrollment and penetration.
+
+```{r scatterplot-b, message=FALSE, warning=FALSE}
+raw_B <- pen_rows
+
+csa_df_B <- raw_B |>
+  dplyr::mutate(
+    group_id = dplyr::if_else(
+      is_non_csa, paste0("All Other Areas - ", state), paste0("CSA ", csa_code)
+    )
+  ) |>
+  dplyr::group_by(group_id, is_non_csa) |>
+  dplyr::summarise(
+    enrolled_sum = sum(enrolled, na.rm = TRUE),
+    eligible_sum = sum(eligible, na.rm = TRUE),
+    pen_agg      = dplyr::if_else(eligible_sum > 0, enrolled_sum / eligible_sum, NA_real_),
+    .groups      = "drop"
+  ) |>
+  dplyr::transmute(
+    name             = group_id,
+    type             = dplyr::if_else(is_non_csa, "Non-CSA", "CSA"),
+    enrolled         = enrolled_sum,
+    penetration_rate = pen_agg
+  ) |>
+  dplyr::filter(!is.na(enrolled), !is.na(penetration_rate), enrolled > 0, penetration_rate >= 0)
+
+csa_df_B <- add_quadrants(csa_df_B, enrolled, penetration_rate)
+med_enrolled_B <- unique(csa_df_B$.med_x)
+med_penrate_B  <- unique(csa_df_B$.med_y)
+
+label_df_B <- csa_df_B |>
+  dplyr::transmute(name, type, dplyr::across(c(enrolled, penetration_rate, quadrant))) |>
+  pick_representatives_by_quadrant(lbl_col = "name", x = enrolled, y = penetration_rate)
+
+scatter_plot_B <- ggplot(
+  csa_df_B, aes(x = enrolled, y = penetration_rate, color = type, shape = type)
+) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_vline(xintercept = med_enrolled_B, linetype = "dashed") +
+  geom_hline(yintercept = med_penrate_B,  linetype = "dashed") +
+  scale_x_log10(
+    breaks = scales::log_breaks(n = 6, base = 10),
+    labels = scales::comma_format()
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(values = type_colors, name = "Area Type") +
+  scale_shape_manual(values = c("CSA" = 16, "Non-CSA" = 15), name = "Area Type") +
+ ggrepel::geom_label_repel(
+  data = label_df_B,
+  aes(label = label),  # <-- use 'label'
+    fill               = "white",
+    colour             = "black",
+    size               = 3,
+    box.padding        = 0.35,
+    point.padding      = 0.3,
+    segment.alpha      = 0.8,
+    min.segment.length = 0,
+    force              = 1.2,
+    show.legend        = FALSE
+  ) +
+  labs(
+    title    = "Medicare Advantage Enrollment vs. Penetration Rate",
+    subtitle = paste0(
+      "Quadrants split at medians (Enrolled = ",
+      scales::comma(med_enrolled_B), ", Penetration = ",
+      scales::percent(med_penrate_B, accuracy = 1), ")."
+    ),
+    x = "Total Enrolled Beneficiaries (log10 scale)",
+    y = "Penetration Rate"
+  ) +
+  guides(
+    color = guide_legend(order = 1, title.position = "top"),
+    shape = guide_legend(order = 1, title.position = "top")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position   = "bottom",
+    legend.box        = "horizontal",
+    legend.text       = element_text(size = 10),
+    legend.title      = element_text(size = 10),
+    legend.spacing.y  = unit(2, "pt"),
+    legend.key.width  = unit(1.2, "lines"),
+    plot.margin       = margin(t = 25, r = 10, b = 40, l = 10)
+  )
+
+scatter_with_marginals_B <- ggExtra::ggMarginal(
+  scatter_plot_B,
+  type    = "histogram",
+  margins = "both",
+  bins    = 30,
+  fill    = "white",
+  colour  = "grey30"
+)
+
+print(scatter_with_marginals_B)
+
+ggsave(
+  filename = results_path("MA_enrollment_penetration_CSA_agg.png"),
+  plot     = scatter_with_marginals_B,
+  width    = 15, height = 8.5, units = "in", dpi = 300
+)
+```
+<u>**C) CSA-Only — Enrollment vs. Penetration (Non-CSA Removed)**</u>
+
+**Purpose**. Focus attention on true CSA markets only, removing the visual variability introduced by non-CSA areas. Use this when preparing market-focused design memos or when comparing CSAs to each other without rural/state “all-other” context.
+
+**How to read:**
+
+Same axes and median logic as B, but only CSAs are plotted.
+
+Legend labels include n per quadrant for quick sizing.
+
+```{r scatterplot-c, message=FALSE, warning=FALSE}
+raw_C <- pen_rows |>
+  dplyr::filter(is_non_csa == FALSE, !is.na(csa_code))
+
+csa_df_C <- raw_C |>
+  dplyr::group_by(csa_code) |>
+  dplyr::summarise(
+    enrolled_sum = sum(enrolled,  na.rm = TRUE),
+    eligible_sum = sum(eligible,  na.rm = TRUE),
+    pen_agg      = dplyr::if_else(eligible_sum > 0, enrolled_sum / eligible_sum, NA_real_),
+    .groups = "drop"
+  ) |>
+  dplyr::transmute(
+    name             = paste0("CSA ", csa_code),
+    enrolled         = enrolled_sum,
+    penetration_rate = pen_agg
+  ) |>
+  dplyr::filter(!is.na(enrolled), !is.na(penetration_rate), enrolled > 0, penetration_rate >= 0)
+
+csa_df_C <- add_quadrants(csa_df_C, enrolled, penetration_rate)
+med_enrolled_C <- unique(csa_df_C$.med_x)
+med_penrate_C  <- unique(csa_df_C$.med_y)
+
+tab_q_C <- table(csa_df_C$quadrant)
+legend_labels_C <- paste0(names(tab_q_C), " (n = ", as.integer(tab_q_C), ")") |>
+  stats::setNames(names(tab_q_C))
+
+label_df_C <- csa_df_C |>
+  dplyr::transmute(name, dplyr::across(c(enrolled, penetration_rate, quadrant))) |>
+  pick_representatives_by_quadrant(lbl_col = "name", x = enrolled, y = penetration_rate)
+
+scatter_plot_C <- ggplot(
+  csa_df_C, aes(x = enrolled, y = penetration_rate, color = quadrant)
+) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_vline(xintercept = med_enrolled_C, linetype = "dashed") +
+  geom_hline(yintercept = med_penrate_C,  linetype = "dashed") +
+  scale_x_log10(
+    breaks = scales::log_breaks(n = 6, base = 10),
+    labels = scales::comma_format()
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.1),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_color_manual(
+    values = quadrant_colors,
+    labels = legend_labels_C,
+    name   = "Quadrant"
+  ) +
+  ggrepel::geom_label_repel(
+    data               = label_df_C,
+    aes(label = label),
+    fill               = "white",
+    colour             = "black",
+    size               = 3,
+    box.padding        = 0.35,
+    point.padding      = 0.3,
+    segment.alpha      = 0.8,
+    min.segment.length = 0,
+    force              = 1.2,
+    show.legend        = FALSE
+  ) +
+  labs(
+    title    = "Medicare Advantage Enrollment vs. Penetration Rate",
+    subtitle = paste0(
+      "Quadrants split at medians (Enrolled = ",
+      scales::comma(med_enrolled_C), ", Penetration = ",
+      scales::percent(med_penrate_C, accuracy = 1), ")."
+    ),
+    x = "Total Enrolled Beneficiaries (log10 scale)",
+    y = "Penetration Rate"
+  ) +
+  guides(color = guide_legend(order = 1)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position   = "bottom",
+    legend.box.margin = margin(t = 8),
+    plot.margin       = margin(t = 25, r = 10, b = 40, l = 10)
+  )
+
+scatter_with_marginals_C <- ggExtra::ggMarginal(
+  scatter_plot_C,
+  type    = "histogram",
+  margins = "both",
+  bins    = 30,
+  fill    = "white",
+  colour  = "grey30"
+)
+
+print(scatter_with_marginals_C)
+
+ggsave(
+  filename = results_path("MA_enrollment_penetration_CSA_only.png"),
+  plot     = scatter_with_marginals_C,
+  width    = 15, height = 8, units = "in", dpi = 300
+)
+
+```
+

@@ -1,0 +1,822 @@
+---
+title: "CSA Enrollment and Penetration Maps"
+author: "Shreya Shankar (sshankar@mitre.org)"
+date: "2025-08-05"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+<!--
+This RMD consolidates three previously separate scripts into one doc.
+
+Files saved to: file.path(data_location, "Results", "Maps", <filename>.png")
+-->
+
+<u>**Executive Summary**</u>
+
+<u>Why this matters:</u> Medicare Advantage (MA) enrollment is concentrated in distinct regional markets that do not always follow state lines. To evaluate where new payment demonstrations might work best, we aggregated county-level MA data (eligibility, enrollment, penetration rates) up to Combined Statistical Areas (CSAs)— a market-like geography the Centers for Medicare & Medicaid Innovation (CMMI) is using to explore a Value Incentive Program (VIP).
+
+This document walks through: (1) how the data are harmonized and validated, (2) how CSAs are assembled from counties, (3) three complementary map views of MA enrollment and penetration, and (4) optional overlays that highlight CSA clusters based on dual eligibility and VIP feasibility flags.
+
+_____________________________________________________________________________________
+
+
+<u>**Data Lineage & Study Scope**</u>
+
+**Source & preparation**. Prior to this README, a spreadsheet was created to clean and standardize county-level MA data and then re-aggregate to CSAs. For counties not assigned to a CSA, values are aggregated at the state “all other” level so the maps maintain complete geographic coverage.
+
+**What’s in the file**. Each record carries:
+
+<u>enrolled</u> – total MA enrollees (count).
+<u>pen_rate</u> – MA penetration among eligible beneficiaries (0–100%).
+<u>csa_number</u> – the three-digit CSA code when applicable.
+<u>state_abbr</u> – two-letter state code (also used for “all other” areas).
+
+**Geographic scope**. Alaska, Hawaii, and U.S. territories are excluded from mapping to keep the contiguous U.S. focus (<u>the full logic remains in code</u> so scope can easily be extended).
+
+**Analytical objective**. Provide market-readable maps that (i) visualize enrollment concentration, (ii) contrast penetration rates, and (iii) surface potential market demonstration areas.
+
+_____________________________________________________________________________________
+
+
+<u>**Reproducibility & Environment**</u>
+
+This section installs/loads required packages, sets caching and GIS options, and defines helper utilities (e.g., a results_path() function) used throughout.
+
+```{r setup-packages, message=FALSE, warning=FALSE}
+##########
+#Packages and Global Options
+##########
+required <- c(
+  "tidyverse", "readxl", "readr", "janitor", "sf", "tigris",
+  "stringr", "RColorBrewer", "rlang", "scales"
+)
+new_pkgs <- setdiff(required, rownames(installed.packages()))
+if (length(new_pkgs)) install.packages(new_pkgs, quiet = TRUE)
+
+lapply(required, library, character.only = TRUE)
+options(tigris_use_cache = TRUE, tigris_class = "sf")
+
+#helper to get results saved to correct folder
+results_path <- function(filename) file.path(results_dir, filename)
+```
+<u>**Paths, Inputs, and Outputs**</u>
+
+This block reads a single DATA_LOCATION.txt that points to a shared Teams directory, verifies that Excel file exists, and creates a Results/Maps folder for images.
+
+```{r paths, message=FALSE, warning=FALSE}
+##########
+#File Paths
+##########
+#DATA_LOCATION.txt contains the file path to the Teams Data folder
+stopifnot(file.exists("DATA_LOCATION.txt"))
+data_location <- readr::read_file("DATA_LOCATION.txt") |> stringr::str_trim()
+
+#load the file from Processed folder
+penrate_path <- file.path(data_location, "Processed", "penrate_r.xlsx")
+if (!file.exists(penrate_path)) {
+  stop("Expected file not found: ", penrate_path,
+       "\nEnsure DATA_LOCATION.txt points to the Teams Data folder and that",
+       "\n'Processed/penrate_r.xlsx' exists.")
+}
+
+#make sure results can save to the right folder
+results_dir <- file.path(data_location, "Results", "Maps")
+if (!dir.exists(results_dir)) dir.create(results_dir, recursive = TRUE)
+```
+
+<u>**Helper Functions (Data & Maps)**</u>
+
+This section defines three building blocks:
+
+**1. parse_pen_rate()**
+Ensures the penetration column is numeric, rescales decimals to percentages when needed, and clamps values to [0, 100]. This protects the visuals from formatting inconsistencies (e.g., “12%” vs “0.12”).
+
+**2. build_df()**
+Normalizes column names, extracts the CSA code and state abbreviation from your label field, and enforces a consistent pen_rate. This keeps data hygiene inside the pipeline so plots won’t break if column names drift slightly.
+
+**3. load_geographies()**
+Downloads counties, states, and CSA boundaries, then assigns each county to a CSA via centroid-in-polygon. This method is robust for mapping and avoids edge cases where complex county geometries straddle CSA borders.
+
+**4. Map styling helpers.**
+make_map_cont() renders a continuous color scale (good for penetration).
+make_map_cat() renders labeled categories/bins (good for enrollment quintiles).
+Both functions support optional state outlines to help orient viewers who think in state boundaries.
+```{r helpers, message=FALSE, warning=FALSE}
+##########
+#Shared Functions
+##########
+
+#Parse through the penetration rate column
+#(numeric vs character, decimal vs percent storage, and clamps to [0,100]).
+parse_pen_rate <- function(df_raw) {
+  #rlang's %||% returns LHS unless NULL
+  pen_col <- rlang::`%||%`(df_raw$penetrration_rate, df_raw$penetration_rate)
+
+  if (is.character(pen_col)) {
+    pen_rate_num <- readr::parse_number(pen_col)
+  } else if (is.numeric(pen_col)) {
+    pen_rate_num <- as.numeric(pen_col)
+  } else {
+    pen_rate_num <- as.numeric(pen_col)
+  }
+
+  max_pen <- suppressWarnings(max(pen_rate_num, na.rm = TRUE))
+  #If stored as decimals (e.g., 0.12), scale to percent (12)
+  if (is.finite(max_pen) && max_pen <= 1.05) pen_rate_num <- pen_rate_num * 100
+
+  #Clamp to [0, 100]
+  pmin(pmax(pen_rate_num, 0), 100)
+}
+
+#Build the working analysis frame from the Excel file
+build_df <- function(path, sheet = "Sheet1") {
+  df_raw <- readxl::read_excel(path, sheet = sheet) |> janitor::clean_names()
+  pen_rate_num <- parse_pen_rate(df_raw)
+
+  df_raw |>
+    transmute(
+      csa_area   = stringr::str_trim(csa_area),
+      enrolled   = sum_of_enrolled,
+      pen_rate   = pen_rate_num,
+      csa_number = stringr::str_extract(csa_area, "\\d+"),
+      state_abbr = stringr::str_extract(csa_area, "[A-Z]{2}$")
+    ) |>
+    mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+}
+
+#Load in geographices once (counties, states, CSA boundaries) and assign counties to CSAs via centroids
+load_geographies <- function() {
+  drop_fips <- c("02","15","72","78","60","66","69")  #AK, HI, PR, VI, AS, GU, MP
+
+  state_lookup <- tigris::fips_codes |>
+    distinct(state_code, state) |>
+    rename(STATEFP = state_code, state_abbr = state)   #'state' is 2-letter abbr
+
+  counties_sf <- tigris::counties(cb = TRUE, year = 2023, refresh = TRUE) |>
+    filter(!STATEFP %in% drop_fips) |>
+    left_join(state_lookup, by = "STATEFP") |>
+    mutate(geoid = GEOID)
+
+  states_sf <- tigris::states(cb = TRUE, year = 2023, refresh = TRUE) |>
+    filter(!STATEFP %in% drop_fips)
+
+  csa_sf <- tigris::combined_statistical_areas(cb = TRUE, year = 2023) |>
+    select(csa_number = GEOID)
+
+  #Assign counties to CSAs via centroid-in-polygon
+  county_centroids <- sf::st_centroid(counties_sf) |>
+    sf::st_join(csa_sf, left = TRUE) |>
+    sf::st_drop_geometry() |>
+    select(geoid, csa_number)
+
+  counties_sf <- counties_sf |>
+    left_join(county_centroids, by = "geoid")
+
+  list(counties_sf = counties_sf, states_sf = states_sf, csa_sf = csa_sf)
+}
+
+#Standardized map theming with parameterized legend behavior.
+make_map_cont <- function(
+  sf_obj, var, title, legend_lab, palette,
+  pen_display = c("percent","share"),
+  overlay_states = FALSE, states_layer = NULL,
+  na_gray = FALSE
+) {
+  pen_display <- match.arg(pen_display)
+  var_quo <- rlang::enquo(var)
+
+  p <- ggplot(sf_obj) +
+    geom_sf(aes(fill = !!var_quo), color = "white", size = 0.15)
+
+  if (overlay_states && !is.null(states_layer)) {
+    p <- p + geom_sf(data = states_layer, fill = NA, color = "grey60", size = 0.2, inherit.aes = FALSE)
+  }
+
+  if (pen_display == "percent") {
+    #Map A behavior: no fixed limits/breaks; legend "Penetration %"
+    p <- p +
+      scale_fill_gradientn(
+        colours  = palette,
+        name     = legend_lab,
+        na.value = if (na_gray) "grey80" else "grey70"
+      )
+  } else {
+    #Maps B/C behavior: limits [0, 100]; 20/40/60/80 ticks; labeled as shares
+    p <- p +
+      scale_fill_gradientn(
+        colours  = palette,
+        name     = legend_lab,
+        limits   = c(0, 100),
+        breaks   = c(20, 40, 60, 80),
+        labels   = function(x) scales::number(x / 100, accuracy = 0.1),
+        na.value = if (na_gray) "grey80" else "grey70",
+        oob      = scales::squish,
+        guide    = guide_colorbar(reverse = FALSE)
+      )
+  }
+
+  p +
+    coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE) +
+    labs(title = title, subtitle = "Geographic Distribution", caption = "Data: CMS, 2025") +
+    theme_void(base_size = 12) +
+    theme(
+      plot.title    = element_text(size = 15, face = "bold", hjust = .5),
+      plot.subtitle = element_text(hjust = .5),
+      legend.title  = element_text(size = 11),
+      legend.text   = element_text(size = 9)
+    )
+}
+
+make_map_cat <- function(
+  sf_obj, var, title, legend_lab, palette,
+  overlay_states = FALSE, states_layer = NULL,
+  na_translate = FALSE, na_color = "grey80"
+) {
+  p <- ggplot(sf_obj) +
+    geom_sf(aes(fill = {{ var }}), color = "white", size = 0.15)
+
+  if (overlay_states && !is.null(states_layer)) {
+    p <- p + geom_sf(data = states_layer, fill = NA, color = "grey60", size = 0.2, inherit.aes = FALSE)
+  }
+
+  p +
+    scale_fill_manual(values = palette, name = legend_lab,
+                      drop = FALSE, na.translate = na_translate, na.value = na_color) +
+    coord_sf(xlim = c(-125, -66), ylim = c(24, 50), expand = FALSE) +
+    labs(title = title, subtitle = "Geographic Distribution", caption = "Data: CMS, 2025") +
+    theme_void(base_size = 12) +
+    theme(
+      plot.title    = element_text(size = 15, face = "bold", hjust = .5),
+      plot.subtitle = element_text(hjust = .5),
+      legend.title  = element_text(size = 11),
+      legend.text   = element_text(size = 9)
+    )
+}
+
+#Reusable color palettes!
+blues_q   <- RColorBrewer::brewer.pal(5, "Blues")
+blues_pct <- colorRampPalette(RColorBrewer::brewer.pal(9, "Blues")[-1])(100)
+```
+<u>**Load Data & Geographies**</u>
+
+At this point, the cleaned spreadsheet is read, geometries are fetched once, and— if available— lwgeom is used to validate shapes. This reduces the risk of topology errors when merging counties into larger polygons.
+
+**How to read downstream logs**: Occasionally there are console outputs summarizing bin cut-offs and quintile thresholds. Those are deliberate diagnostics to keep transparency about how the bins were defined in each run.
+
+```{r data-and-geo, message=FALSE, warning=FALSE}
+###########
+#Load Data + Geographies
+###########
+df <- build_df(penrate_path, sheet = "Sheet1")
+geo <- load_geographies()
+counties_sf <- geo$counties_sf
+states_sf   <- geo$states_sf
+csa_sf      <- geo$csa_sf
+
+#Validate geometries to avoid pathological unions
+if (requireNamespace("lwgeom", quietly = TRUE)) {
+  counties_sf <- sf::st_make_valid(counties_sf)
+}
+
+```
+
+<u>**A) CSA+1 Maps — Enrollment Quintiles & Penetration (State-Split Preserved)**</u>
+
+**Goal**. Show fine-grained variation inside multi-state CSAs by keeping each CSA×State as a separate market polygon (“CSA+1”). Non-CSA counties are aggregated to a state ‘all other’ region, so the map remains wall-to-wall.
+
+**What the code does.**
+
+1. Dissolves counties to CSA×State units and attaches the associated enrollment and penetration for each unit.
+2. Builds a companion layer for non-CSA counties aggregated to the state.
+3. Computes dynamic enrollment quintiles based on the actual distribution in the loaded data.
+4. Produces two complementary maps:
+Enrollment (categorical) with data-driven quintiles.
+Penetration (continuous) with a percentage legend (0–100, auto-scaled).
+
+**How to read this graphic:**
+Darker blues in the enrollment map mean larger MA markets (by headcount).
+Darker blues in the penetration map mean higher MA share of eligible beneficiaries.
+
+Because CSA+1 preserves state splits, you can see within-CSA, cross-state differences that would be hidden if we merged them.
+
+**Why both maps**: Enrollment highlights market size (implementation scale, potential absolute impact). Penetration highlights market adoption (policy acceptance, competitive intensity). Together they help separate big-but-low-share markets from small-but-high-share niches.
+
+```{r a-csa-plus-1, message=FALSE, warning=FALSE}
+#County --> CSA (by state)
+county_with_csa_dissolved_A <- counties_sf |>
+  filter(!is.na(csa_number)) |>
+  mutate(csa_number = as.character(csa_number)) |>
+  left_join(
+    df |>
+      filter(!is.na(csa_number)) |>
+      mutate(csa_number = as.character(csa_number)) |>
+      select(csa_number, state_abbr, enrolled, pen_rate),
+    by = c("csa_number", "state_abbr")
+  ) |>
+  group_by(csa_number, state_abbr) |>
+  summarise(
+    enrolled = dplyr::first(enrolled),
+    pen_rate = dplyr::first(pen_rate),
+    .groups  = "drop"
+  )
+
+#Non-CSA --> "all other" by state
+state_other_vals_A <- df |>
+  filter(is.na(csa_number)) |>
+  select(state_abbr, enrolled, pen_rate)
+
+county_no_csa_dissolved_A <- counties_sf |>
+  filter(is.na(csa_number)) |>
+  left_join(state_other_vals_A, by = "state_abbr") |>
+  group_by(state_abbr) |>
+  summarise(
+    enrolled = dplyr::first(enrolled),
+    pen_rate = dplyr::first(pen_rate),
+    .groups  = "drop"
+  )
+
+#final map 
+plot_df_A <- bind_rows(
+  county_with_csa_dissolved_A,
+  county_no_csa_dissolved_A
+) |>
+  st_as_sf() |>
+  mutate(
+    enroll_q = dplyr::ntile(enrolled, 5),
+    enroll_q = factor(
+      enroll_q, levels = 1:5,
+      labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)")
+    )
+  )
+
+#diagnostics
+cat("\n===== Enrollment Quintile Cut-points =====\n")
+quintile_breaks_A <- quantile(plot_df_A$enrolled, probs = seq(0, 1, 0.20), na.rm = TRUE)
+print(quintile_breaks_A)
+
+cat("\n===== Min / Max Enrollment in Each Quintile =====\n")
+quintile_ranges_A <- plot_df_A |>
+  st_drop_geometry() |>
+  group_by(enroll_q) |>
+  summarise(
+    min_enrolled = min(enrolled, na.rm = TRUE),
+    max_enrolled = max(enrolled, na.rm = TRUE),
+    n_areas      = dplyr::n(),
+    .groups      = "drop"
+  ) |>
+  arrange(enroll_q)
+print(quintile_ranges_A)
+
+#maps
+enrollment_map_A <- make_map_cat(
+  sf_obj      = plot_df_A,
+  var         = enroll_q,
+  title       = "Medicare Advantage Enrollment",
+  legend_lab  = "Enrollment Quintile",
+  palette     = blues_q,
+  overlay_states = FALSE
+)
+
+penetration_map_A <- make_map_cont(
+  sf_obj      = plot_df_A,
+  var         = pen_rate,
+  title       = "Medicare Advantage Penetration Rate",
+  legend_lab  = "Penetration %",
+  palette     = blues_pct,
+  pen_display = "percent",         # Section A: "percent" legend behavior
+  overlay_states = FALSE
+)
+
+print(enrollment_map_A)
+print(penetration_map_A)
+
+ggsave(results_path("enrollment_map.png"),  enrollment_map_A,  width = 11, height = 6, dpi = 300)
+ggsave(results_path("penetration_map.png"), penetration_map_A, width = 11, height = 6, dpi = 300)
+```
+_____________________________________________________________________________________
+
+
+<u>**B) CSA (Merged) — Fixed Enrollment Bins & Penetration (Shares)**</u>
+
+**Goal**. Present a market-level view by merging split-state CSAs into single units and summarizing penetration as an enrollment-weighted average.
+
+**What the code does.**
+
+Sums enrollment across a CSA (regardless of state).
+
+Calculates penetration as a weighted mean (weights = enrolled), then enforces [0, 100].
+
+Keeps non-CSA areas aggregated to their states for complete coverage.
+
+Uses fixed enrollment ranges (e.g., “50k–100k”) instead of dynamic quintiles, which makes cross-run comparisons easier for stakeholders.
+
+**How to read this graphic:**
+
+Enrollment (fixed bins) provides a stable legend (e.g., “Q3: 50–100k”), which helps when you compare renders across months or scenarios.
+
+Penetration (shares) fixes the legend to 0–1.00 (displayed as 0–100%), with reference ticks at 0.20/0.40/0.60/0.80, nudging viewers to think in fractions as well as percentages.
+
+**When to use A vs B:**
+
+<u>Use A</u> (CSA+1) to spotlight intra-CSA, cross-state variation.
+
+<u>Use B</u> (CSA merged) when you want a single policy unit aligned to how demonstrations are scoped.
+
+```{r b-csa-merged, message=FALSE, warning=FALSE}
+#Merge split-state CSAs on data (enrollment-weighted penetration)
+df_csa_merged_B <- df |>
+  filter(!is.na(csa_number)) |>
+  mutate(csa_number = as.character(csa_number)) |>
+  group_by(csa_number) |>
+  summarise(
+    enrolled = sum(enrolled, na.rm = TRUE),
+    pen_rate = {
+      keep <- !is.na(pen_rate) & !is.na(enrolled) & enrolled > 0
+      w    <- sum(enrolled[keep], na.rm = TRUE)
+      if (w == 0) NA_real_
+      else sum(pen_rate[keep] * enrolled[keep], na.rm = TRUE) / w
+    },
+    .groups = "drop"
+  ) |>
+  mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+
+#Remove state splits
+old_s2 <- sf::sf_use_s2()
+sf::sf_use_s2(FALSE)
+
+county_with_csa_dissolved_B <- counties_sf |>
+  filter(!is.na(csa_number)) |>
+  mutate(csa_number = as.character(csa_number)) |>
+  group_by(csa_number) |>
+  summarise(.groups = "drop") |>
+  left_join(df_csa_merged_B, by = "csa_number")
+
+sf::sf_use_s2(old_s2)
+
+
+#non-CSA values kept at state level
+state_other_vals_B <- df |>
+  filter(is.na(csa_number)) |>
+  select(state_abbr, enrolled, pen_rate)
+
+county_no_csa_dissolved_B <- counties_sf |>
+  filter(is.na(csa_number)) |>
+  left_join(state_other_vals_B, by = "state_abbr") |>
+  group_by(state_abbr) |>
+  summarise(
+    enrolled = dplyr::first(enrolled),
+    pen_rate = dplyr::first(pen_rate),
+    .groups  = "drop"
+  ) |>
+  mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+
+#fixed ranges for quintiles
+enroll_breaks_B <- c(770, 25000, 50000, 100000, 200000, 2000000)
+enroll_labels_B <- c(
+  "Q1: 770–25,000",
+  "Q2: 25,000–50,000",
+  "Q3: 50,000–100,000",
+  "Q4: 100,000–200,000",
+  "Q5: 200,000–2,000,000"
+)
+
+plot_df_B <- bind_rows(
+  county_with_csa_dissolved_B,
+  county_no_csa_dissolved_B
+) |>
+  st_as_sf() |>
+  mutate(
+    pen_rate = pmin(pmax(pen_rate, 0), 100),
+    enroll_q = case_when(
+      enrolled <  enroll_breaks_B[1] ~ enroll_labels_B[1],
+      enrolled >= enroll_breaks_B[6] ~ enroll_labels_B[5],
+      TRUE ~ as.character(cut(
+        enrolled,
+        breaks = enroll_breaks_B,
+        labels = enroll_labels_B,
+        right  = FALSE,
+        include.lowest = TRUE
+      ))
+    ),
+    enroll_q = factor(enroll_q, levels = enroll_labels_B)
+  )
+
+cat("\n=== Enrollment fixed-bin counts (Q1–Q5) ===\n")
+enr_fixed_counts_B <- plot_df_B |>
+  st_drop_geometry() |>
+  group_by(enroll_q) |>
+  summarise(n_areas = dplyr::n(), .groups = "drop")
+print(enr_fixed_counts_B)
+
+cat("\n=== Enrollment actual ranges by fixed bin (min–max) ===\n")
+enr_fixed_ranges_B <- plot_df_B |>
+  st_drop_geometry() |>
+  group_by(enroll_q) |>
+  summarise(
+    bin_min = min(enrolled, na.rm = TRUE),
+    bin_max = max(enrolled, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(enroll_q) |>
+  mutate(
+    bin_min = scales::comma(bin_min, accuracy = 1),
+    bin_max = scales::comma(bin_max, accuracy = 1)
+  )
+print(enr_fixed_ranges_B)
+
+missing_all_other_B <- counties_sf |>
+  filter(is.na(csa_number)) |>
+  distinct(state_abbr) |>
+  anti_join(df |> filter(is.na(csa_number)) |> distinct(state_abbr), by = "state_abbr")
+cat("\nStates missing 'all other' penetration in the sheet:\n")
+print(missing_all_other_B)
+
+#maps
+enrollment_map_B <- make_map_cat(
+  sf_obj      = plot_df_B,
+  var         = enroll_q,
+  title       = "Medicare Advantage Enrollment",
+  legend_lab  = "Enrollment Category",
+  palette     = blues_q
+)
+
+penetration_map_B <- make_map_cont(
+  sf_obj      = plot_df_B,
+  var         = pen_rate,
+  title       = "Medicare Advantage Penetration Rate",
+  legend_lab  = "Penetration (share)",
+  palette     = blues_pct,
+  pen_display = "share"
+)
+
+print(enrollment_map_B)
+print(penetration_map_B)
+
+ggsave(results_path("enrollment_map_csa-merged.png"),  enrollment_map_B,  width = 11, height = 6, dpi = 300)
+ggsave(results_path("penetration_map_csa-merged.png"), penetration_map_B, width = 11, height = 6, dpi = 300)
+```
+
+_____________________________________________________________________________________
+
+
+<u>**C) CSA-Only Maps + Centroid Overlays**</u>
+
+**Goal**. Focus exclusively on CSAs (non-CSA areas are shown in neutral grey) and layer centroid markers for four selections pulled from an ad-hoc workbook. These selections are driven by two flags:
+
+<u>dual_lis_flag (0/1)</u> – indicates presence of dual-eligible/LIS populations.
+<u>viable_area_units_gt500_... (0/1)</u> – denotes feasibility thresholds for VIP (e.g., sufficient area units).
+
+**What the code does.**
+
+1. Merges each CSA’s counties into a single polygon and computes enrollment and weighted penetration.
+
+2. Categorizes enrollment using the same fixed bins as section B (for comparability).
+
+3. Creates four overlay layers by filtering the ad-hoc table and plotting CSA centroids on top of the base map:
+
+Dual 0, VIP Comp 0
+Dual 0, Current VIP 0
+Dual 1, VIP Comp 0
+Dual 1, Current VIP 0
+
+**How to read these graphics:**
+
+The base fill shows enrollment category across CSAs; grey indicates non-CSA areas.
+
+Black dots mark CSAs that meet the specified selection criteria.
+
+```{r c-csa-only, message=FALSE, warning=FALSE}
+#Dissolve CSAs (merged across states) for CSA-only maps
+df_csa_merged_C <- df |>
+  filter(!is.na(csa_number)) |>
+  mutate(csa_number = as.character(csa_number)) |>
+  group_by(csa_number) |>
+  summarise(
+    enrolled = sum(enrolled, na.rm = TRUE),
+    pen_rate = {
+      keep <- !is.na(pen_rate) & !is.na(enrolled) & enrolled > 0
+      w    <- sum(enrolled[keep], na.rm = TRUE)
+      if (w == 0) NA_real_
+      else sum(pen_rate[keep] * enrolled[keep], na.rm = TRUE) / w
+    },
+    .groups = "drop"
+  ) |>
+  mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+
+old_s2 <- sf::sf_use_s2()
+sf::sf_use_s2(FALSE)
+
+county_with_csa_dissolved_C <- counties_sf |>
+  filter(!is.na(csa_number)) |>
+  mutate(csa_number = as.character(csa_number)) |>
+  group_by(csa_number) |>
+  summarise(.groups = "drop") |>
+  left_join(df_csa_merged_C, by = "csa_number")
+
+sf::sf_use_s2(old_s2)
+
+state_other_vals_C <- df |>
+  filter(is.na(csa_number)) |>
+  select(state_abbr, enrolled, pen_rate)
+
+county_no_csa_dissolved_C <- counties_sf |>
+  filter(is.na(csa_number)) |>
+  left_join(state_other_vals_C, by = "state_abbr") |>
+  group_by(state_abbr) |>
+  summarise(
+    enrolled = dplyr::first(enrolled),
+    pen_rate = dplyr::first(pen_rate),
+    .groups  = "drop"
+  ) |>
+  mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+
+plot_df_C <- bind_rows(
+  county_with_csa_dissolved_C,
+  county_no_csa_dissolved_C
+) |>
+  st_as_sf() |>
+  mutate(pen_rate = pmin(pmax(pen_rate, 0), 100))
+
+#fixed ranges for quintiles
+enroll_breaks_C <- c(770, 25000, 50000, 100000, 200000, 2000000)
+enroll_labels_C <- c(
+  "Q1: 770–25,000",
+  "Q2: 25,000–50,000",
+  "Q3: 50,000–100,000",
+  "Q4: 100,000–200,000",
+  "Q5: 200,000–2,000,000"
+)
+
+csa_only_tbl <- plot_df_C |>
+  st_drop_geometry() |>
+  filter(!is.na(csa_number))
+
+csa_bins_C <- csa_only_tbl |>
+  mutate(
+    enroll_q = case_when(
+      enrolled <  enroll_breaks_C[1] ~ enroll_labels_C[1],
+      enrolled >= enroll_breaks_C[6] ~ enroll_labels_C[5],
+      TRUE ~ as.character(cut(
+        enrolled,
+        breaks = enroll_breaks_C,
+        labels = enroll_labels_C,
+        right  = FALSE,
+        include.lowest = TRUE
+      ))
+    )
+  ) |>
+  mutate(enroll_q = factor(enroll_q, levels = enroll_labels_C)) |>
+  select(csa_number, enroll_q)
+
+plot_df_C <- plot_df_C |>
+  left_join(csa_bins_C, by = "csa_number") |>
+  mutate(
+    #Only CSAs get penetration color-- non-CSA areas are NA (grey)
+    pen_rate_csa = if_else(is.na(csa_number), NA_real_, pen_rate)
+  )
+
+#maps
+enrollment_map_C <- make_map_cat(
+  sf_obj      = plot_df_C,
+  var         = enroll_q,
+  title       = "Medicare Advantage Enrollment",
+  legend_lab  = "Enrollment (fixed ranges)",
+  palette     = blues_q,
+  overlay_states = TRUE,  states_layer = states_sf,       
+  na_translate   = TRUE,  na_color     = "grey80"
+)
+
+penetration_map_C <- make_map_cont(
+  sf_obj      = plot_df_C,
+  var         = pen_rate_csa,
+  title       = "Medicare Advantage Penetration Rate",
+  legend_lab  = "Penetration (share)",
+  palette     = blues_pct,
+  pen_display = "share",
+  overlay_states = TRUE,  states_layer = states_sf,
+  na_gray        = TRUE
+)
+
+print(enrollment_map_C)
+print(penetration_map_C)
+
+ggsave(results_path("enrollment_map_csa-only.png"),  enrollment_map_C,  width = 11, height = 6, dpi = 300)
+ggsave(results_path("penetration_map_csa-only.png"), penetration_map_C, width = 11, height = 6, dpi = 300)
+
+# =========
+# Centroids (dynamic selections from the spreadsheet)
+# =========
+
+dropoff_path <- file.path(
+  data_location, "Processed", "Ad Hoc", "DropoffCounts_CSAPG_ReportingUnits.xlsx"
+)
+if (!file.exists(dropoff_path)) {
+  stop("File not found: ", dropoff_path)
+}
+
+drop_tbl <- readxl::read_excel(dropoff_path) |>
+  janitor::clean_names() |>
+  #Only keep rows where the name contains "CSA"
+  dplyr::filter(stringr::str_detect(csa_area, stringr::regex("\\bCSA\\b", ignore_case = TRUE))) |>
+  dplyr::mutate(
+    csa_code = stringr::str_extract(csa_area, "\\b\\d{3}\\b"),
+    #Coerce filters to numeric so 0/1 tests work even if sheet typed as text
+    dual_lis_flag = as.numeric(dual_lis_flag),
+    viable_area_units_gt500_current_vip_comp = as.numeric(viable_area_units_gt500_current_vip_comp),
+    viable_area_units_gt500_current_vip      = as.numeric(viable_area_units_gt500_current_vip)
+  )
+
+#Build the four selection vectors
+selected_csas_Dual0_VIP0 <- drop_tbl |>
+  dplyr::filter(dual_lis_flag == 0, viable_area_units_gt500_current_vip_comp == 0) |>
+  dplyr::pull(csa_code) |> unique() |> stats::na.omit() |> as.character()
+
+selected_csas_Dual1_Curr <- drop_tbl |>
+  dplyr::filter(dual_lis_flag == 1, viable_area_units_gt500_current_vip == 0) |>
+  dplyr::pull(csa_code) |> unique() |> stats::na.omit() |> as.character()
+
+selected_csas_Dual1_VIP0 <- drop_tbl |>
+  dplyr::filter(dual_lis_flag == 1, viable_area_units_gt500_current_vip_comp == 0) |>
+  dplyr::pull(csa_code) |> unique() |> stats::na.omit() |> as.character()
+
+selected_csas_Dual0_Curr <- drop_tbl |>
+  dplyr::filter(dual_lis_flag == 0, viable_area_units_gt500_current_vip == 0) |>
+  dplyr::pull(csa_code) |> unique() |> stats::na.omit() |> as.character()
+
+#Convert those selections to centroid layers
+# --- Dual 0, VIP Comp 0 ---
+csa_centroids_Dual0_VIP0 <- county_with_csa_dissolved_C |>
+  dplyr::filter(!is.na(csa_number), csa_number %in% selected_csas_Dual0_VIP0) |>
+  sf::st_point_on_surface()
+
+dual0_vip0_map <- make_map_cat(
+  plot_df_C, enroll_q,
+  title      = "Dual 0, VIP Comp 0",
+  legend_lab = "Enrollment (fixed ranges)",
+  palette    = blues_q,
+  overlay_states = TRUE, states_layer = states_sf,
+  na_translate = TRUE, na_color = "grey80"
+) +
+  geom_sf(data = csa_centroids_Dual0_VIP0, color = "black", size = 1.8, shape = 16, inherit.aes = FALSE)
+
+print(dual0_vip0_map)
+ggsave(results_path("dual0_vip0_map.png"), dual0_vip0_map, width = 11, height = 6, dpi = 300)
+
+# --- Dual 0, Current VIP 0 ---
+csa_centroids_Dual0_Curr <- county_with_csa_dissolved_C |>
+  dplyr::filter(!is.na(csa_number), csa_number %in% selected_csas_Dual0_Curr) |>
+  sf::st_point_on_surface()
+
+dual0_curr_vip0_map <- make_map_cat(
+  plot_df_C, enroll_q,
+  title      = "Dual 0, Current VIP 0",
+  legend_lab = "Enrollment (fixed ranges)",
+  palette    = blues_q,
+  overlay_states = TRUE, states_layer = states_sf,
+  na_translate = TRUE, na_color = "grey80"
+) +
+  geom_sf(data = csa_centroids_Dual0_Curr, color = "black", size = 1.8, shape = 16, inherit.aes = FALSE)
+
+print(dual0_curr_vip0_map)
+ggsave(results_path("dual0_curr_vip0_map.png"), dual0_curr_vip0_map, width = 11, height = 6, dpi = 300)
+
+# --- Dual 1, VIP Comp 0 ---
+csa_centroids_Dual1_VIP0 <- county_with_csa_dissolved_C |>
+  dplyr::filter(!is.na(csa_number), csa_number %in% selected_csas_Dual1_VIP0) |>
+  sf::st_point_on_surface()
+
+dual1_vip0_map <- make_map_cat(
+  plot_df_C, enroll_q,
+  title      = "Dual 1, VIP Comp 0",
+  legend_lab = "Enrollment (fixed ranges)",
+  palette    = blues_q,
+  overlay_states = TRUE, states_layer = states_sf,
+  na_translate = TRUE, na_color = "grey80"
+) +
+  geom_sf(data = csa_centroids_Dual1_VIP0, color = "black", size = 1.8, shape = 16, inherit.aes = FALSE)
+
+print(dual1_vip0_map)
+ggsave(results_path("dual1_vip0_map.png"), dual1_vip0_map, width = 11, height = 6, dpi = 300)
+
+# --- Dual 1, Current VIP 0 ---
+csa_centroids_Dual1_Curr <- county_with_csa_dissolved_C |>
+  dplyr::filter(!is.na(csa_number), csa_number %in% selected_csas_Dual1_Curr) |>
+  sf::st_point_on_surface()
+
+dual1_curr_vip0_map <- make_map_cat(
+  plot_df_C, enroll_q,
+  title      = "Dual 1, Current VIP 0",
+  legend_lab = "Enrollment (fixed ranges)",
+  palette    = blues_q,
+  overlay_states = TRUE, states_layer = states_sf,
+  na_translate = TRUE, na_color = "grey80"
+) +
+  geom_sf(data = csa_centroids_Dual1_Curr, color = "black", size = 1.8, shape = 16, inherit.aes = FALSE)
+
+print(dual1_curr_vip0_map)
+ggsave(results_path("dual1_curr_vip0_map.png"), dual1_curr_vip0_map, width = 11, height = 6, dpi = 300)
+
+```
